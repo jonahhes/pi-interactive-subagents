@@ -1,15 +1,20 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { type SubagentWaitingReason } from "./activity.ts";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
 
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
+// Resolve to the real (non-symlink) location so the upward `../..` lands in
+// the real package root (where config.json lives) regardless of how the
+// extension directory is linked/installed.
+const PACKAGE_ROOT = join(realpathSync(dirname(fileURLToPath(import.meta.url))), "../..");
+const DEFAULT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
+const CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
 export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
 export type SubagentStatusSource = "pi" | "claude";
@@ -22,6 +27,48 @@ export interface StatusConfig {
   lineLimit: number;
 }
 
+/**
+ * Where a top-level subagent opens: "panes" splits off the caller's pane
+ * (the historical default), "tabs" gives it its own labelled tab. Nested
+ * subagents always open as panes, inside the subagent's own tab/window.
+ */
+export type SpawnSurface = "panes" | "tabs";
+
+/**
+ * Which subagent surface BACKEND to use: the terminal multiplexer hosting
+ * the parent pi process (herdr/tmux), or the headless `background` backend
+ * (detached pi child, output to a log file, no pane). `auto` is
+ * herdr → tmux → background: `auto` never fails, background is the floor.
+ * This is orthogonal to `SpawnSurface` (panes|tabs), which only decides how
+ * a multiplexer surface is arranged and is ignored for background.
+ */
+export type SpawnBackend = "auto" | "herdr" | "tmux" | "background";
+
+export interface SpawnConfig {
+  surface: SpawnSurface;
+  backend?: SpawnBackend;
+}
+
+/**
+ * An extension loaded into every subagent regardless of its `tools` frontmatter
+ * (e.g. bash-guard, which hard-blocks catastrophic bash commands in headless
+ * sessions). Entries may be extension directories (a directory with a
+ * package.json `pi.extensions` manifest or an index.ts/index.js) or a single
+ * extension file (.ts/.js), absolute or `~/`-prefixed. Relative paths are
+ * rejected — config.json lives inside this package, so relative entries would
+ * silently mean different things per install location.
+ */
+export interface AlwaysOnExtensionsConfig {
+  paths: string[];
+  errors: string[];
+}
+
+export interface SubagentConfig {
+  status: StatusConfig;
+  spawn: SpawnConfig;
+  alwaysOnExtensions: AlwaysOnExtensionsConfig;
+}
+
 export type StatusObservation =
   | {
       snapshot: "present";
@@ -32,6 +79,7 @@ export type StatusObservation =
       activeScope?: string;
       activeSince?: number;
       waitingSince?: number;
+      waitingReason?: SubagentWaitingReason;
       latestEvent?: string;
       activityLabel?: string;
     }
@@ -52,6 +100,7 @@ export interface SubagentStatusState {
   activeSinceMs: number | null;
   activeScope: string | null;
   waitingSinceMs: number | null;
+  waitingReason: SubagentWaitingReason | null;
   phase: StatusActivityPhase | null;
   latestEvent: string | null;
   activityLabel: string | null;
@@ -69,6 +118,7 @@ export interface StatusSnapshot {
   activeDurationText: string | null;
   activeScope: string | null;
   waitingSinceMs: number | null;
+  waitingReason: SubagentWaitingReason | null;
   waitingDurationText: string | null;
   latestEvent: string | null;
   activityLabel: string | null;
@@ -83,20 +133,20 @@ export interface CappedStatusLines {
   overflow: number;
 }
 
-function invalidStatusConfig(source: string, message: string): never {
-  throw new Error(`Invalid subagent status config in ${source}: ${message}`);
+function invalidConfig(source: string, message: string): never {
+  throw new Error(`Invalid subagent config in ${source}: ${message}`);
 }
 
 function requireObject(value: unknown, source: string, fieldName: string): Record<string, unknown> {
   if (value == null || typeof value !== "object" || Array.isArray(value)) {
-    invalidStatusConfig(source, `${fieldName} must be an object`);
+    invalidConfig(source, `${fieldName} must be an object`);
   }
   return value as Record<string, unknown>;
 }
 
 function requireBoolean(value: unknown, source: string, fieldName: string): boolean {
   if (typeof value !== "boolean") {
-    invalidStatusConfig(source, `${fieldName} must be a boolean`);
+    invalidConfig(source, `${fieldName} must be a boolean`);
   }
   return value;
 }
@@ -109,7 +159,7 @@ function rejectUnsupportedKeys(
 ): void {
   const unsupportedKeys = Object.keys(value).filter((key) => !allowedKeys.includes(key));
   if (unsupportedKeys.length > 0) {
-    invalidStatusConfig(source, `${fieldName} has unsupported key(s): ${unsupportedKeys.join(", ")}`);
+    invalidConfig(source, `${fieldName} has unsupported key(s): ${unsupportedKeys.join(", ")}`);
   }
 }
 
@@ -149,7 +199,174 @@ export function parseStatusConfig(rawConfig: unknown, source = "config.json"): S
   };
 }
 
-function readStatusConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
+/**
+ * Parse the optional `spawn` section. An absent section (older config files)
+ * defaults to "panes" so existing configs keep today's behaviour.
+ */
+export function parseSpawnConfig(rawConfig: unknown, source = "config.json"): SpawnConfig {
+  const config = requireObject(rawConfig, source, "root");
+  if (config.spawn == null) return { surface: "panes" };
+  const spawn = requireObject(config.spawn, source, "spawn");
+  rejectUnsupportedKeys(spawn, ["surface", "backend"], source, "spawn");
+  if (spawn.surface !== "panes" && spawn.surface !== "tabs") {
+    invalidConfig(source, `spawn.surface must be "panes" or "tabs"`);
+  }
+  if (
+    spawn.backend !== undefined &&
+    spawn.backend !== "auto" &&
+    spawn.backend !== "herdr" &&
+    spawn.backend !== "tmux" &&
+    spawn.backend !== "background"
+  ) {
+    invalidConfig(
+      source,
+      `spawn.backend must be "auto", "herdr", "tmux" or "background"`,
+    );
+  }
+  const result: SpawnConfig = { surface: spawn.surface };
+  if (spawn.backend !== undefined) result.backend = spawn.backend;
+  return result;
+}
+
+/**
+ * Whether an absolute extension path is loadable by pi's child process:
+ * a file (pi loads it as the entry point) or a directory with a package.json
+ * `pi.extensions` manifest or an index.ts/index.js. pi's loader resolves
+ * directories through the package manifest, so a directory without either
+ * would be silently dropped in the child - flag it here instead.
+ */
+function extensionLoadabilityError(value: string): string | null {
+  let stats;
+  try {
+    stats = statSync(value);
+  } catch {
+    return `${value} does not exist (skipped in all subagents)`;
+  }
+  if (stats.isFile()) return null;
+  if (!stats.isDirectory()) {
+    return `${value} is not a file or directory (skipped in all subagents)`;
+  }
+  if (existsSync(join(value, "index.ts")) || existsSync(join(value, "index.js"))) return null;
+  try {
+    const manifest = JSON.parse(readFileSync(join(value, "package.json"), "utf8"));
+    if (Array.isArray(manifest?.pi?.extensions) && manifest.pi.extensions.length > 0) return null;
+  } catch {
+    // No readable manifest: fall through to the not-loadable error.
+  }
+  return `${value} is a directory without a package.json pi.extensions manifest or index.ts/index.js (not a loadable extension path)`;
+}
+
+/**
+ * Parse the optional `alwaysOnExtensions` section. An absent section (older
+ * config files) means "no always-on extensions" so existing configs keep
+ * today's behaviour. The child process resolves the entries with its own
+ * pi loader (pi supports both explicit files and extension directories), so
+ * validation here is deliberately structural only: it rejects relative paths
+ * (config.json is package-local, so they would be ambiguous) and unknown keys,
+ * and warns (without failing the spawn) about entries that are missing or not
+ * loadable on the parent's machine.
+ */
+export function parseAlwaysOnExtensionsConfig(
+  rawConfig: unknown,
+  source = "config.json",
+): AlwaysOnExtensionsConfig {
+  const config = requireObject(rawConfig, source, "root");
+  if (config.alwaysOnExtensions == null) return { paths: [], errors: [] };
+  const raw = requireObject(config.alwaysOnExtensions, source, "alwaysOnExtensions");
+  rejectUnsupportedKeys(raw, ["paths"], source, "alwaysOnExtensions");
+  if (raw.paths == null) return { paths: [], errors: [] };
+  if (!Array.isArray(raw.paths)) {
+    invalidConfig(source, "alwaysOnExtensions.paths must be an array");
+  }
+  const errors: string[] = [];
+  const paths: string[] = [];
+  raw.paths.forEach((entry, i) => {
+    if (typeof entry !== "string" || !entry.trim()) {
+      invalidConfig(
+        source,
+        `alwaysOnExtensions.paths[${i}] must be a non-empty string (an absolute or ~/ path)`,
+      );
+    }
+    const value = entry.trim();
+    if (value === "~") {
+      errors.push(
+        `alwaysOnExtensions.paths[${i}] is "~" (the home directory is not a loadable extension path)`,
+      );
+      return;
+    }
+    if (value.startsWith("-")) {
+      invalidConfig(
+        source,
+        `alwaysOnExtensions.paths[${i}] is an exclusion marker (leading "-"): exclusions only apply per-agent via the always-on-extensions frontmatter, not in config.json`,
+      );
+    }
+    if (value.startsWith("~/")) {
+      const home = homedir();
+      const expanded = home ? join(home, value.slice(2)) : null;
+      const problem = expanded ? extensionLoadabilityError(expanded) : null;
+      if (problem) {
+        errors.push(`alwaysOnExtensions.paths[${i}] "${value}": ${problem}`);
+      } else {
+        // Keep the ~/ form unexpanded: the child may resolve ~ differently at
+        // launch time (see resolveAlwaysOnExtensionPaths in index.ts).
+        paths.push(value);
+      }
+      return;
+    }
+    if (!value.startsWith("/")) {
+      invalidConfig(
+        source,
+        `alwaysOnExtensions.paths[${i}] "${entry}" must be an absolute or ~/ path (config.json is package-local, so relative paths are ambiguous)`,
+      );
+    }
+    const problem = extensionLoadabilityError(value);
+    if (problem) {
+      errors.push(`alwaysOnExtensions.paths[${i}] "${value}": ${problem}`);
+      return;
+    }
+    paths.push(value);
+  });
+  return { paths, errors };
+}
+
+/**
+ * Resolve the effective spawn surface: the PI_SUBAGENT_SPAWN_SURFACE env
+ * override (case-insensitive, trimmed) wins over the config value. An
+ * unrecognised override value is a configuration error and throws.
+ */
+export function resolveSpawnSurface(
+  envOverride: string | undefined,
+  configSurface: SpawnSurface,
+): SpawnSurface {
+  const raw = envOverride?.trim().toLowerCase();
+  if (!raw) return configSurface;
+  if (raw === "panes" || raw === "tabs") return raw;
+  throw new Error(
+    `Invalid PI_SUBAGENT_SPAWN_SURFACE value "${raw}" (expected "panes" or "tabs").`,
+  );
+}
+
+/**
+ * Resolve the effective spawn backend preference: the PI_SUBAGENT_BACKEND
+ * env override (case-insensitive, trimmed) wins over the config value. An
+ * unrecognised override value is a configuration error and throws. This is
+ * a PREFERENCE only ("auto" still resolves dynamically against the
+ * environment); see resolveSurfaceBackend in surface.ts for the resolution
+ * itself.
+ */
+export function resolveSpawnBackend(
+  envOverride: string | undefined,
+  configBackend: SpawnBackend,
+): SpawnBackend {
+  const raw = envOverride?.trim().toLowerCase();
+  if (!raw) return configBackend;
+  if (raw === "auto" || raw === "herdr" || raw === "tmux" || raw === "background") return raw;
+  throw new Error(
+    `Invalid PI_SUBAGENT_BACKEND="${raw}"; expected "auto", "herdr", "tmux" or "background".`,
+  );
+}
+
+function readSubagentConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
   try {
     return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
   } catch (error) {
@@ -163,18 +380,18 @@ function readStatusConfigFile(configPath: string, examplePath: string): { source
     const errno = error as NodeJS.ErrnoException;
     if (errno.code === "ENOENT") {
       throw new Error(
-        `Missing subagent status config. Expected ${configPath} or ${examplePath}.`,
+        `Missing subagent config. Expected ${configPath} or ${examplePath}.`,
       );
     }
     throw error;
   }
 }
 
-export function loadStatusConfig(
-  configPath = DEFAULT_STATUS_CONFIG_PATH,
-  examplePath = STATUS_CONFIG_EXAMPLE_PATH,
-): StatusConfig {
-  const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
+export function loadSubagentConfig(
+  configPath = DEFAULT_CONFIG_PATH,
+  examplePath = CONFIG_EXAMPLE_PATH,
+): SubagentConfig {
+  const { sourcePath, rawConfig } = readSubagentConfigFile(configPath, examplePath);
 
   let parsed: unknown;
   try {
@@ -184,7 +401,11 @@ export function loadStatusConfig(
     throw new Error(`Invalid JSON in subagent config ${sourcePath}: ${detail}`);
   }
 
-  return parseStatusConfig(parsed, sourcePath);
+  return {
+    status: parseStatusConfig(parsed, sourcePath),
+    spawn: parseSpawnConfig(parsed, sourcePath),
+    alwaysOnExtensions: parseAlwaysOnExtensionsConfig(parsed, sourcePath),
+  };
 }
 
 export function formatElapsedDuration(ms: number): string {
@@ -215,6 +436,7 @@ export function createStatusState(params: {
     activeSinceMs: null,
     activeScope: null,
     waitingSinceMs: null,
+    waitingReason: null,
     phase: null,
     latestEvent: null,
     activityLabel: null,
@@ -276,6 +498,7 @@ export function observeStatus(
     activeSinceMs,
     activeScope: activeNow ? observation.activeScope ?? null : null,
     waitingSinceMs,
+    waitingReason: observation.waitingReason ?? null,
     phase,
     latestEvent: observation.latestEvent ?? null,
     activityLabel: observation.activityLabel ?? null,
@@ -300,6 +523,7 @@ export function forceStatusAfterInterrupt(state: SubagentStatusState, now: numbe
     activeSinceMs: null,
     activeScope: null,
     waitingSinceMs: now,
+    waitingReason: null,
     phase: "waiting",
     latestEvent: "interrupt_requested",
     activityLabel: "interrupted",
@@ -349,6 +573,7 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
       activeDurationText: null,
       activeScope: null,
       waitingSinceMs: null,
+      waitingReason: null,
       waitingDurationText: null,
       latestEvent: null,
       activityLabel: null,
@@ -400,6 +625,7 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     activeDurationText,
     activeScope: state.activeScope,
     waitingSinceMs: state.waitingSinceMs,
+    waitingReason: state.waitingReason,
     waitingDurationText,
     latestEvent: state.latestEvent,
     activityLabel: state.activityLabel,

@@ -108,6 +108,32 @@ export interface SubagentLoadout {
   identity: string | null;
   /** Agents this subagent was allowed to spawn (for PI_SUBAGENT_ALLOWED). */
   spawnable: string[] | null;
+  /**
+   * Extra always-on extension entries from the agent's `always-on-extensions`
+   * frontmatter, in addition to the global config.json `alwaysOnExtensions`
+   * (which is re-resolved at every launch and not stored here). Null/absent
+   * for agentless spawns and snapshots written before this field existed.
+   */
+  alwaysOnExtensions: string[] | null;
+  /**
+   * The agent's `bash-guard-mode` frontmatter value (raw, lowercase-trim) —
+   * null when the agent had no field. Snapshotted so resume can replay the
+   * same mode as spawn (emitted into the child as PI_BASH_GUARD_MODE). Old
+   * snapshots written before this field existed simply lack the key;
+   * readSubagentLoadout returns the object as-is, so a missing key reads back
+   * as undefined and is treated as null (no env emitted). Do NOT require it.
+   */
+  bashGuardMode?: string | null;
+  /**
+   * The agent's `cli` frontmatter value (e.g. `claude`), or null for the pi CLI.
+   * Snapshotted so resume can re-run the S4 fail-closed check against the
+   * snapshot (the check needs to know the child's CLI). Old snapshots written
+   * before this field existed lack the key; resume treats a missing key as the
+   * pi CLI (see the resume guard) - safe, because spawn refuses a guard-mode
+   * child on `cli: claude`, so the only guard-mode children that ever existed
+   * were pi children.
+   */
+  cli?: string | null;
   /** Whether the agent auto-exits (informational; resume forces autonomous). */
   autoExit: boolean;
   /** Working directory the subagent ran in, or null. */
@@ -184,15 +210,20 @@ export function readNameRegistry(artifactDir: string): NameRegistry {
  * Register (or overwrite) a name → session mapping for a spawner session.
  * Writes atomically (temp file + rename) so a concurrent reader never sees a
  * partial registry.
+ *
+ * Returns the previously registered entry for this name (if any) so the caller
+ * can surface the replacement instead of silently destroying the old mapping.
  */
 export function registerName(
   artifactDir: string,
   name: string,
   entry: NameRegistryEntry,
-): void {
+): NameRegistryEntry | null {
+  let replaced: NameRegistryEntry | null = null;
   try {
     mkdirSync(artifactDir, { recursive: true });
     const registry = readNameRegistry(artifactDir);
+    replaced = registry[name] ?? null;
     registry[name] = entry;
     const p = nameRegistryPath(artifactDir);
     const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
@@ -202,6 +233,7 @@ export function registerName(
     // Best-effort: a failed registration only means resume-by-name won't find
     // this subagent later; it never breaks the spawn itself.
   }
+  return replaced;
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */
@@ -211,6 +243,29 @@ export function resolveNameInRegistry(
 ): NameRegistryEntry | null {
   const entry = readNameRegistry(artifactDir)[name];
   return entry && typeof entry.sessionFile === "string" ? entry : null;
+}
+
+/**
+ * Remove a name from the registry (no-op when absent). Exported for tests;
+ * the production S3 fallback path no longer calls it: the retry re-registers
+ * its name IN PLACE, atomically overwriting the failed primary's registry
+ * entry (registerName is last-writer-wins), so the name stays resolvable —
+ * to the finished primary — for the whole retry window. The removed
+ * entry's session file stays on disk untouched.
+ */
+export function deleteName(artifactDir: string, name: string): void {
+  try {
+    const registry = readNameRegistry(artifactDir);
+    if (!(name in registry)) return;
+    delete registry[name];
+    const p = nameRegistryPath(artifactDir);
+    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+    renameSync(tmp, p);
+  } catch {
+    // Best-effort: a failed removal surfaces as a collision refusal on the
+    // retry (which reports the existing entry), never a silent corruption.
+  }
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {
@@ -461,6 +516,25 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
   return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
+}
+
+/**
+ * S3: whether a session produced ANY non-whitespace assistant text (any
+ * assistant message with a non-empty `text` content block). The synthetic
+ * fallback summaries the watcher writes for failed runs ("Subagent error:…",
+ * "Sub-agent exited without output") are NOT assistant text, so the check runs
+ * on the session entries themselves — this is what `hasAssistantText` in the
+ * watcher result is derived from.
+ */
+export function sessionHasAssistantText(entries: SessionEntry[]): boolean {
+  return entries.some((entry) =>
+    entry?.type === "message" &&
+    (entry as any).message?.role === "assistant" &&
+    Array.isArray((entry as any).message.content) &&
+    ((entry as any).message.content as Array<Record<string, unknown>>).some(
+      (block) => block?.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
+    ),
+  );
 }
 
 /**

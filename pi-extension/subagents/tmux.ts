@@ -1,10 +1,11 @@
 /**
- * tmux surface layer — the only terminal multiplexer this extension supports.
+ * tmux backend for the subagent surface layer.
  *
- * Everything the extension does to a pane goes through the small API in this
- * file: create/split a pane, type a command into it, read its screen, close
- * it, and poll for exit. Keeping the tmux calls isolated here means index.ts
- * stays testable without a multiplexer running.
+ * Everything the extension does to a tmux pane goes through the small API in
+ * this file: create/split a pane, type a command into it, read its screen,
+ * close it. Keeping the tmux calls isolated here means index.ts stays
+ * testable without a multiplexer running. The herdr equivalent lives in
+ * herdr.ts; surface.ts dispatches to the right backend at runtime.
  *
  * Panes are identified by tmux pane ids (e.g. `%12`). Splits always target
  * the parent pi's pane (`$TMUX_PANE`) so they follow the agent rather than
@@ -12,7 +13,7 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -97,6 +98,7 @@ function rebalanceSurfaces(hintPane?: string): void {
       // -t <pane> resolves to that pane's window; does not change focus.
       execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
         encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
       });
     } catch {
       // Pane/window may be gone; balancing is best-effort.
@@ -105,6 +107,16 @@ function rebalanceSurfaces(hintPane?: string): void {
 }
 
 // ── Surface primitives ──
+//
+// Every tmux call below that blocks the event loop (execFileSync) sets an
+// explicit stdio: ["ignore","pipe","pipe"]. Node's execFileSync, when given no
+// stdio option, re-forwards the captured child stderr to the parent's stderr —
+// which inside a multiplexer pane is the user's TTY — so a tmux CLI error
+// (e.g. "can't find pane" right after a pane is closed) would flash onto the
+// screen even though the error is caught and handled. Piping keeps stdout/
+// stderr captured (readScreen's return value, error classification) while
+// keeping the parent TTY clean. The async execFileAsync calls already pipe by
+// default and need no change.
 
 /**
  * Create a new pane for a subagent: a right split off the parent pi's pane,
@@ -144,7 +156,7 @@ export function createSurfaceSplit(
   }
   args.push("-P", "-F", "#{pane_id}");
 
-  const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
+  const pane = execFileSync("tmux", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
   if (!pane.startsWith("%")) {
     throw new Error(`Unexpected tmux split-window output: ${pane}`);
   }
@@ -154,14 +166,75 @@ export function createSurfaceSplit(
 }
 
 /**
+ * Create a dedicated tmux window (tab) for a top-level subagent, labelled with
+ * `name` and starting in `cwd`. The window is created detached (`-d`) so the
+ * active window/pane keeps focus, and returns the window's initial pane id
+ * (e.g. `%13`).
+ *
+ * `new-window -n <label>` sets the window name AND disables automatic-rename
+ * for it, so the label survives the shell running inside.
+ *
+ * `-t` must be a session (or session:window-index), not a pane; we resolve the
+ * caller's session name from its pane id (handles spaces in session names).
+ */
+export async function createSurfaceTab(name: string, cwd?: string): Promise<string> {
+  requireTmux();
+
+  const pane = process.env.TMUX_PANE;
+  if (!pane) {
+    throw new Error("TMUX_PANE is not set - the parent pi process is not running in a tmux pane");
+  }
+
+  const session = execFileSync("tmux", ["display-message", "-p", "-t", pane, "#{session_name}"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  if (!session) {
+    throw new Error("Failed to resolve tmux session name for tab creation");
+  }
+
+  const args = ["new-window", "-d", "-n", name, "-t", session];
+  if (cwd) args.push("-c", cwd);
+  args.push("-P", "-F", "#{pane_id}");
+
+  const paneId = execFileSync("tmux", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  if (!paneId.startsWith("%")) {
+    throw new Error(`Unexpected tmux new-window output: ${paneId}`);
+  }
+
+  // No rebalance: the new window has a single pane, and the caller's window
+  // is untouched (it keeps its own even layout).
+  return paneId;
+}
+
+/**
+ * Close the entire window that contains `surface` (all its panes). `kill-window`
+ * accepts a pane as its target and resolves to that pane's window.
+ */
+export function closeSurfaceContainer(surface: string): void {
+  requireTmux();
+  try {
+    execFileSync("tmux", ["kill-window", "-t", surface], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch {
+    // Window/pane may already be gone.
+  }
+}
+
+/**
  * Send a command string to a pane and execute it.
  * Typed literally (`-l`) so special characters are not interpreted as keys,
  * then submitted with Enter.
  */
 export function sendCommand(surface: string, command: string): void {
   requireTmux();
-  execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
-  execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
+  execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 
 /**
@@ -203,6 +276,21 @@ export function sendLongCommand(
 }
 
 /**
+ * Send Escape to cancel the in-flight turn in a pane. Async (not execSync) so
+ * the interrupt tool never blocks the event loop on a stuck pane. The caller
+ * closes the pane afterwards to guarantee termination — Escape alone may only
+ * park the session (pi's abort path keeps it open for inspection).
+ */
+export async function sendEscape(surface: string, signal?: AbortSignal): Promise<void> {
+  requireTmux();
+  await execFileAsync("tmux", ["send-keys", "-t", surface, "Escape"], {
+    encoding: "utf8",
+    signal,
+    timeout: 5_000,
+  });
+}
+
+/**
  * Read the screen contents of a pane (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
@@ -212,6 +300,7 @@ export function readScreen(surface: string, lines = 50): string {
     ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     {
       encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
 }
@@ -234,121 +323,25 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   requireTmux();
-  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   rebalanceSurfaces();
 }
 
+/**
+ * Label a pane (tmux pane title, shown with pane borders). Cosmetic and
+ * best-effort: a missing label must never break spawning.
+ */
+export function labelSurface(surface: string, label: string): void {
+  const trimmed = label.trim();
+  if (!trimmed) return;
+  try {
+    execFileSync("tmux", ["select-pane", "-t", surface, "-T", trimmed], { stdio: "ignore" });
+  } catch {
+    // Title may be unsupported; ignore.
+  }
+}
+
 // ── Exit polling ──
-
-export interface PollResult {
-  /** How the subagent exited */
-  reason: "done" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
-  exitCode: number;
-  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
-  errorMessage?: string;
-}
-
-/**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
- *
- * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
- * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
- */
-function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
-  }
-  return { reason: "done", exitCode: 0 };
-}
-
-export const __pollForExitTest__ = { interpretExitSidecar };
-
-/**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by the error path), falling back to the terminal sentinel for
- * clean-completion and crash detection.
- */
-export async function pollForExit(
-  surface: string,
-  signal: AbortSignal,
-  options: {
-    interval: number;
-    sessionFile?: string;
-    sentinelFile?: string;
-    onTick?: (elapsed: number) => void;
-  },
-): Promise<PollResult> {
-  const start = Date.now();
-
-  for (;;) {
-    if (signal.aborted) {
-      throw new Error("Aborted while waiting for subagent to finish");
-    }
-
-    // Fast path: check for .exit sidecar file (written by the error path)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
-    }
-
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
-    }
-
-    // Slow path: read terminal screen for sentinel (crash detection)
-    try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-      }
-    } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
-      }
-    }
-
-    const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
-
-    await new Promise<void>((resolve, reject) => {
-      if (signal.aborted) return reject(new Error("Aborted"));
-      const timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }, options.interval);
-      function onAbort() {
-        clearTimeout(timer);
-        reject(new Error("Aborted"));
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-  }
-}
+// Shared by both backends: lives in surface.ts so it has one definition.
+// Re-exported here for backward compatibility (tests and older imports).
+export { pollForExit, type PollResult, __pollForExitTest__ } from "./surface.ts";

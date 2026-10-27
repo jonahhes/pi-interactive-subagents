@@ -4,6 +4,15 @@ import { dirname, join } from "node:path";
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
 export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
 
+/**
+ * Why a parked (phase "waiting") subagent is waiting. Recorded by the
+ * `agent_settled` park gate so the parent can tell an actionable wait (an
+ * unanswered `ask_question`) from an unactionable one (waiting for its own
+ * children's results). Absent when the wait has no such reason (e.g. aborted,
+ * or an interactive child idle at the prompt).
+ */
+export type SubagentWaitingReason = "ask_question" | "own_children";
+
 export type SubagentActivityEvent =
   | "session_start"
   | "input"
@@ -44,6 +53,7 @@ export interface SubagentActivityState {
   toolName?: string;
   toolStartedAt?: number;
   toolEndedAt?: number;
+  waitingReason?: SubagentWaitingReason;
 }
 
 export type ActivityReadResult =
@@ -71,12 +81,14 @@ export interface SubagentActivityRecorder {
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
   askQuestion(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
+  setWaitingReason(reason: SubagentWaitingReason | null): void;
 }
 
 const ACTIVITY_UPDATE_THROTTLE_MS = 500;
 const MAX_WRITE_FAILURES = 3;
 const KNOWN_PHASES = new Set<SubagentActivityPhase>(["starting", "active", "waiting", "done"]);
 const KNOWN_SCOPES = new Set<SubagentActivityScope>(["agent", "turn", "provider", "streaming", "tool"]);
+const KNOWN_WAITING_REASONS = new Set<SubagentWaitingReason>(["ask_question", "own_children"]);
 const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_start",
   "input",
@@ -137,6 +149,16 @@ function validateOptionalActivityString(object: Record<string, unknown>, fieldNa
   return value.length <= MAX_ACTIVITY_STRING_LENGTH ? null : `${fieldName} is too long`;
 }
 
+function validateOptionalEnum(
+  object: Record<string, unknown>,
+  fieldName: string,
+  known: Set<string>,
+): string | null {
+  const value = object[fieldName];
+  if (value == null) return null;
+  return typeof value === "string" && known.has(value) ? null : `unknown ${fieldName}`;
+}
+
 function invalidActivity(error: string): ActivityReadResult {
   return { ok: false, reason: "invalid", error };
 }
@@ -176,6 +198,7 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
+    validateOptionalEnum(object, "waitingReason", KNOWN_WAITING_REASONS),
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
@@ -238,6 +261,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolExecutionEnd() {},
     askQuestion() {},
     sessionShutdown() {},
+    setWaitingReason() {},
   };
 }
 
@@ -285,6 +309,8 @@ function markActive(
   activity.activeScope = scope;
   if (activity.activeSince == null || resetActiveSince) activity.activeSince = now;
   delete activity.waitingSince;
+  // A stale waiting reason must never survive into an active phase.
+  delete activity.waitingReason;
 }
 
 export function createSubagentActivityRecorder(params: {
@@ -329,7 +355,10 @@ export function createSubagentActivityRecorder(params: {
   }
 
   function flushNow(): void {
-    if (disabled) return;
+    // The recorder is a noop unless activityFile was set (see
+    // createSubagentActivityRecorder), but keep the guard so flushNow is
+    // safe even if that invariant ever changes.
+    if (disabled || !activityFile) return;
     try {
       writeSubagentActivityFile(activityFile, activity);
       lastFlushAt = now();
@@ -378,6 +407,7 @@ export function createSubagentActivityRecorder(params: {
       current.phase = "done";
       clearActiveState(current);
       delete current.waitingSince;
+      delete current.waitingReason;
     }, "immediate");
     disable();
   }
@@ -501,6 +531,15 @@ export function createSubagentActivityRecorder(params: {
         clearActiveState(current);
         current.phase = "waiting";
         current.waitingSince = observedAt;
+      }, "immediate");
+    },
+    setWaitingReason(reason) {
+      // Record which park reason applied at the agent_settled gate (or clear
+      // it). Immediate flush: park transitions must be visible on the next
+      // 1 s parent tick, not throttled.
+      record("agent_end", (current) => {
+        if (reason == null) delete current.waitingReason;
+        else current.waitingReason = reason;
       }, "immediate");
     },
     sessionShutdown(reason) {

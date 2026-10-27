@@ -1,5 +1,12 @@
 {
   "status": {
     "enabled": true
+  },
+  "spawn": {
+    "surface": "tabs",
+    "backend": "auto"
+  },
+  "alwaysOnExtensions": {
+    "paths": ["~/.pi/agent/extensions/bash-guard"]
   }
 }

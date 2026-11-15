@@ -13,6 +13,7 @@ import {
   copyFileSync,
   unlinkSync,
   realpathSync,
+  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -368,16 +369,30 @@ function parseBashGuardMode(value: string | undefined): string | undefined {
   return v ? v : undefined;
 }
 
+/**
+ * Agent files are hand-written markdown that travels between machines and
+ * editors, so LF-only line endings are NOT safe to assume: a directory copied
+ * from a Windows machine arrives as CRLF, and a strict `/^---\n/` fence match
+ * then drops every file silently (that made a whole agents/ dir invisible).
+ * A UTF-8 BOM would break the leading fence the same way. Normalize both here,
+ * once, so every frontmatter regex below only ever sees plain LF.
+ */
+function normalizeAgentFileContent(content: string): string {
+  const withoutBom = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+  return withoutBom.replace(/\r\n?/g, "\n");
+}
+
 function parseAgentDefinition(
   content: string,
   fallbackName: string,
   sourceFile?: string,
 ): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const normalized = normalizeAgentFileContent(content);
+  const match = normalized.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
 
   const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const body = normalized.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
 
   return {
@@ -428,7 +443,10 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
         file.replace(/\.md$/, ""),
         filePath,
       );
-      if (!parsed) continue;
+      if (!parsed) {
+        warnUnparsableAgentFileOnce(filePath);
+        continue;
+      }
       warnInvalidBashGuardModeOnce(parsed);
       warnInvalidModelFallbackOnce(parsed);
       agents.set(parsed.name, { ...parsed, source });
@@ -439,6 +457,24 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   // it is permitted to spawn (PI_SUBAGENT_ALLOWED). Top-level sessions see all.
   const all = [...agents.values()];
   return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
+}
+
+/**
+ * An agent file without a readable `---` frontmatter block used to be skipped
+ * without a trace: discovery dropped it from `subagents_list` (so spawning it
+ * failed with "not a known agent") and `loadAgentDefaults` silently fell
+ * through to the next source, possibly a package default with a different
+ * model and toolset. One console.warn per file per session keeps that
+ * mistake visible without spamming every spawn.
+ */
+const warnedUnparsableAgentFiles = new Set<string>();
+function warnUnparsableAgentFileOnce(sourceFile: string): void {
+  if (warnedUnparsableAgentFiles.has(sourceFile)) return;
+  warnedUnparsableAgentFiles.add(sourceFile);
+  console.warn(
+    `[subagents] skipping ${sourceFile}: no "---" frontmatter block at the top of the file ` +
+      `(only a fenced file defines an agent)`,
+  );
 }
 
 /**
@@ -561,6 +597,9 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
     if (!existsSync(p)) continue;
     const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName, p);
     if (parsed) return parsed;
+    // Exists but does not parse: warn rather than silently using the next
+    // source, whose model/toolset may differ from the file the user edited.
+    warnUnparsableAgentFileOnce(p);
   }
 
   return null;
@@ -1552,20 +1591,58 @@ export function validateBashGuardMode(
   );
 }
 
+/** The install-dir name the bash-guard docs prescribe for a linked checkout. */
+const BASH_GUARD_INSTALL_DIR_NAME = "bash-guard";
+/** The bash-guard extension's `package.json` name. */
+const BASH_GUARD_PACKAGE_NAME = "pi-bash-guard";
+
 /**
- * True when `path` resolves to a loadable bash-guard extension, i.e. its
- * canonical (symlink-resolved) basename is `bash-guard` — the documented
- * install name (the `~/.pi/agent/extensions/bash-guard` symlink or a repo
- * checkout dir). Used to fail-closed: an always-on extension set that holds
- * some extension OTHER than bash-guard must not satisfy a guard-requiring
- * mode.
+ * Read an extension entry's package name: a directory carries its own
+ * `package.json`, while an explicit entry file (pi loads `<dir>/index.ts` as the
+ * entry point) is identified by its parent directory's manifest.
+ */
+function readExtensionPackageName(path: string): string | null {
+  // A directory carries its own manifest. Only an explicit entry FILE is
+  // identified through its parent: a subdirectory of a package is loaded as its
+  // own extension, so its parent's manifest says nothing about what pi loads
+  // there (falling back to the parent for directories would fail OPEN - a
+  // subdir of a bash-guard checkout would pass for the guard itself).
+  let dir: string;
+  try {
+    dir = statSync(path).isFile() ? dirname(path) : path;
+  } catch {
+    return null;
+  }
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as {
+      name?: unknown;
+    };
+    return typeof manifest.name === "string" ? manifest.name : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when `path` resolves to a loadable bash-guard extension. Used to
+ * fail-closed: an always-on extension set that holds some extension OTHER than
+ * bash-guard must not satisfy a guard-requiring mode (`read-only`, `floor`,
+ * `prompt`).
+ *
+ * Identity is matched two ways, because the install dir name is not stable:
+ *   - the documented linked-checkout name, `~/.pi/agent/extensions/bash-guard`
+ *     (the guard README's `ln -s ~/repos/bash-guard ~/.pi/agent/extensions/bash-guard`);
+ *   - the package name `pi-bash-guard` from the extension's `package.json`, which
+ *     is what a checkout or `pi install` under any other directory name carries.
+ * A basename-only check refused every such install (e.g. a checkout at
+ * `.../extensions/pi-bash-guard`, or an npm install at `.../pi-bash-guard`),
+ * leaving guard-requiring agents unspawnable with no way to fix it but renaming
+ * the directory.
  */
 function isBashGuardExtensionPath(path: string): boolean {
-  try {
-    return basename(canonicalExtensionPath(path)) === "bash-guard";
-  } catch {
-    return false;
-  }
+  const canonical = canonicalExtensionPath(path);
+  if (basename(canonical) === BASH_GUARD_INSTALL_DIR_NAME) return true;
+  return readExtensionPackageName(canonical) === BASH_GUARD_PACKAGE_NAME;
 }
 
 /**

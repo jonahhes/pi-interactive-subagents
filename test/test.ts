@@ -769,12 +769,28 @@ describe("status.ts", () => {
 
   it("loads a valid config file", () => {
     const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
-    const config = loadSubagentConfig(examplePath);
+    withTempDir((dir) => {
+      // The example's ~/ extension path is validated against $HOME, so pin it to
+      // a fake home that actually has that path: a real home decides otherwise
+      // (e.g. this machine installs bash-guard as pi-bash-guard) and this test
+      // would pass or fail per machine.
+      const fakeHome = join(dir, "home");
+      const guardDir = join(fakeHome, ".pi", "agent", "extensions", "bash-guard");
+      mkdirSync(guardDir, { recursive: true });
+      writeFileSync(join(guardDir, "index.ts"), "export default (pi) => {};\n");
+      const previousHome = process.env.HOME;
+      process.env.HOME = fakeHome;
+      try {
+        const config = loadSubagentConfig(examplePath);
 
-    assert.deepEqual(config, {
-      status: { enabled: true, lineLimit: 4 },
-      spawn: { surface: "tabs", backend: "auto" },
-      alwaysOnExtensions: { paths: ["~/.pi/agent/extensions/bash-guard"], errors: [] },
+        assert.deepEqual(config, {
+          status: { enabled: true, lineLimit: 4 },
+          spawn: { surface: "tabs", backend: "auto" },
+          alwaysOnExtensions: { paths: ["~/.pi/agent/extensions/bash-guard"], errors: [] },
+        });
+      } finally {
+        restoreEnvVar("HOME", previousHome);
+      }
     });
   });
 
@@ -4683,6 +4699,167 @@ describe("bash-guard-mode (per-agent guard modes)", () => {
     });
   });
 
+  describe("agent file line endings / BOM (S1)", () => {
+    // writeAgentFile always writes LF; these cases need exact bytes.
+    function writeRawAgentFile(agentsDir: string, file: string, content: string): string {
+      mkdirSync(agentsDir, { recursive: true });
+      const filePath = join(agentsDir, file);
+      writeFileSync(filePath, content);
+      return filePath;
+    }
+
+    it("discovers and loads a CRLF agent file in the global agents dir", async () => {
+      await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+        const filePath = writeRawAgentFile(
+          globalAgentsDir,
+          "crlf-agent.md",
+          [
+            "---",
+            "name: crlf-agent",
+            "model: anthropic/claude-x",
+            "tools: bash, read",
+            "bash-guard-mode: read-only",
+            "---",
+            "",
+            "You are a CRLF agent.",
+            "",
+          ].join("\r\n"),
+        );
+        // A CRLF agents/ dir came from another machine: it must not vanish.
+        const listed = testApi.discoverAgentDefinitions().find((a: any) => a.name === "crlf-agent");
+        assert.ok(listed, "expected the CRLF agent file to be discovered");
+        assert.equal(listed.source, "global");
+
+        const loaded = testApi.loadAgentDefaults("crlf-agent");
+        assert.ok(loaded, "expected the CRLF agent file to load");
+        assert.equal(loaded.name, "crlf-agent");
+        assert.equal(loaded.model, "anthropic/claude-x");
+        assert.equal(loaded.tools, "bash, read");
+        assert.equal(loaded.bashGuardMode, "read-only");
+        assert.equal(loaded.sourceFile, filePath);
+        // The body is normalized too: a stray CR would reach the child prompt.
+        assert.ok(loaded.body.includes("You are a CRLF agent."));
+        assert.ok(!loaded.body.includes("\r"), "body must not contain CR");
+      });
+    });
+
+    it("discovers and loads a UTF-8 BOM + CRLF agent file (no BOM in the name)", async () => {
+      await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+        const filePath = writeRawAgentFile(
+          globalAgentsDir,
+          "bom-agent.md",
+          "\uFEFF" +
+            [
+              "---",
+              "name: bom-agent",
+              "model: anthropic/claude-y",
+              "---",
+              "",
+              "You are a BOM agent.",
+              "",
+            ].join("\r\n"),
+        );
+        // Windows editors prepend a BOM before the fence; both must be stripped.
+        const listed = testApi.discoverAgentDefinitions().find((a: any) => a.name === "bom-agent");
+        assert.ok(listed, "expected the BOM agent file to be discovered");
+
+        const loaded = testApi.loadAgentDefaults("bom-agent");
+        assert.ok(loaded, "expected the BOM agent file to load");
+        assert.equal(loaded.name, "bom-agent");
+        assert.ok(!loaded.name.includes("\uFEFF"), "name must not carry the BOM");
+        assert.equal(loaded.model, "anthropic/claude-y");
+        assert.equal(loaded.sourceFile, filePath);
+        assert.ok(!loaded.body.includes("\uFEFF"), "body must not contain the BOM");
+        assert.ok(!loaded.body.includes("\r"), "body must not contain CR");
+      });
+    });
+
+    it("parses a file whose line endings are lone CR only", async () => {
+      await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+        const filePath = writeRawAgentFile(
+          globalAgentsDir,
+          "cr-agent.md",
+          [
+            "---",
+            "name: cr-agent",
+            "model: anthropic/claude-z",
+            "---",
+            "",
+            "You are a CR agent.",
+            "",
+          ].join("\r"),
+        );
+        // Classic-Mac line endings are rare but must not be a silent drop.
+        const loaded = testApi.loadAgentDefaults("cr-agent");
+        assert.ok(loaded, "expected the lone-CR agent file to load");
+        assert.equal(loaded.name, "cr-agent");
+        assert.equal(loaded.model, "anthropic/claude-z");
+        assert.equal(loaded.sourceFile, filePath);
+        assert.ok(!loaded.body.includes("\r"), "body must not contain CR");
+      });
+    });
+
+    it("ignores a frontmatter-less file and warns once per file per session", async () => {
+      const origWarn = console.warn;
+      const warned: string[] = [];
+      console.warn = (m: unknown) => warned.push(String(m));
+      try {
+        await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+          const filePath = writeRawAgentFile(
+            globalAgentsDir,
+            "no-fence.md",
+            "name: no-fence\n\nThis file lost its frontmatter fence.\n",
+          );
+          const agents = testApi.discoverAgentDefinitions();
+          assert.ok(
+            !agents.some((a: any) => a.sourceFile === filePath),
+            "a frontmatter-less file must not be listed",
+          );
+          const forFile = () => warned.filter((w) => w.includes(filePath));
+          assert.equal(forFile().length, 1, "expected exactly one warning for the file");
+          // The user must be able to find the file from the message alone.
+          assert.ok(
+            forFile()[0].startsWith(
+              `[subagents] skipping ${filePath}: no "---" frontmatter block`,
+            ),
+            `unexpected warning text: ${forFile()[0]}`,
+          );
+          // Discovery runs on every spawn: the warning must not repeat.
+          testApi.discoverAgentDefinitions();
+          assert.equal(forFile().length, 1, "expected no second warning for the same file");
+        });
+      } finally {
+        console.warn = origWarn;
+      }
+    });
+
+    it("warns on a broken global worker.md and falls through to the bundled definition", async () => {
+      const origWarn = console.warn;
+      const warned: string[] = [];
+      console.warn = (m: unknown) => warned.push(String(m));
+      try {
+        await withIsolatedAgentEnv(async ({ globalAgentsDir }) => {
+          const brokenPath = writeRawAgentFile(
+            globalAgentsDir,
+            "worker.md",
+            "name: worker\n\nThis file lost its frontmatter fence.\n",
+          );
+          const loaded = testApi.loadAgentDefaults("worker");
+          // The silent fall-through was the bug: the warn is the only signal.
+          const forFile = warned.filter((w) => w.includes(brokenPath));
+          assert.equal(forFile.length, 1, "expected a warning naming the broken global path");
+          assert.match(forFile[0], /no "---" frontmatter block at the top of the file/);
+          assert.ok(loaded, "expected the package-bundled worker to load instead");
+          assert.notEqual(loaded.sourceFile, brokenPath);
+          assert.ok(loaded.sourceFile && existsSync(loaded.sourceFile));
+          assert.match(loaded.sourceFile!, /worker\.md$/);
+        });
+      } finally {
+        console.warn = origWarn;
+      }
+    });
+  });
+
   it("validateBashGuardMode: invalid mode names raw value and source file; valid/absent pass", () => {
     // Invalid: names the raw value AND the source file.
     assert.equal(
@@ -5215,6 +5392,130 @@ describe("bash-guard-mode (per-agent guard modes)", () => {
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
+    });
+  });
+
+  // The guard's install dir name is not stable: the README links a checkout in
+  // as `bash-guard`, but a bare checkout or a `pi install` under the published
+  // package name lives in `pi-bash-guard`. Identity therefore has to come from
+  // the extension's own manifest too - a basename-only check made every
+  // guard-requiring agent unspawnable on such an install, with no fix but
+  // renaming the directory.
+  describe("bash-guard extension identity (S4)", () => {
+    // The spawn guard takes the agent's frontmatter entries as EXTRA entries on
+    // top of config.json, so pin that source empty: only the temp dirs below may
+    // identify as bash-guard, regardless of what the host machine has installed.
+    function guardError(mode: string | undefined, entries: string[]): string | null {
+      testApi.__setAlwaysOnExtensionsConfigForTest([]);
+      return testApi.assertBashGuardLoaded("bgm-identity", mode as string, undefined, entries);
+    }
+
+    // A loadable extension dir: pi loads `<dir>/index.ts`, and `package.json` is
+    // what a checkout or package install carries under its published name.
+    function makeExtension(dir: string, manifest?: object): string {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "index.ts"), "export default (pi) => {};\n");
+      if (manifest) writeFileSync(join(dir, "package.json"), JSON.stringify(manifest) + "\n");
+      return dir;
+    }
+
+    const PI_BASH_GUARD_MANIFEST = {
+      name: "pi-bash-guard",
+      pi: { extensions: ["./index.ts"] },
+    };
+
+    afterEach(() => {
+      testApi.__setAlwaysOnExtensionsConfigForTest(null);
+    });
+
+    it("allows the documented `bash-guard` linked-checkout dir", () => {
+      withTempDir((d) => {
+        // The documented install name alone identifies the guard, even without
+        // a manifest (that is what the README's `ln -s` symlink looks like).
+        const guard = makeExtension(join(d, "extensions", "bash-guard"));
+        assert.equal(guardError("read-only", [guard]), null);
+      });
+    });
+
+    it("allows a checkout installed under the package name `pi-bash-guard`", () => {
+      withTempDir((d) => {
+        const guard = makeExtension(join(d, "extensions", "pi-bash-guard"), PI_BASH_GUARD_MANIFEST);
+        assert.equal(guardError("read-only", [guard]), null);
+      });
+    });
+
+    it("allows an explicit entry FILE inside a `pi-bash-guard` install (parent manifest)", () => {
+      withTempDir((d) => {
+        const guard = makeExtension(join(d, "extensions", "pi-bash-guard"), PI_BASH_GUARD_MANIFEST);
+        // pi also accepts the entry point itself as an always-on path, so the
+        // identity has to be read from the FILE's parent manifest.
+        assert.equal(guardError("floor", [join(guard, "index.ts")]), null);
+      });
+    });
+
+    it("refuses a subdirectory inside a `pi-bash-guard` checkout (no parent-manifest identity)", () => {
+      withTempDir((d) => {
+        // Fail-closed regression: a subdirectory is loaded by pi as its OWN
+        // extension, so the parent checkout's manifest says nothing about what
+        // runs there. Reading the parent manifest for a DIR entry would fail
+        // OPEN - a subdir of a guard checkout (its own index.ts, no manifest)
+        // would pass for the guard itself and an unguarded child would spawn
+        // under `bash-guard-mode: read-only` with bash NOT guarded.
+        const checkout = makeExtension(join(d, "repos", "pi-bash-guard"), PI_BASH_GUARD_MANIFEST);
+        // Resolved and loadable (its own index.ts), but carries no manifest.
+        const nested = makeExtension(join(checkout, "extra-ext"));
+        const err = guardError("read-only", [nested]);
+        assert.ok(err, "expected a spawn error for a subdirectory of a guard checkout");
+        assert.match(err, /bash-guard is not in the resolved always-on extensions/);
+      });
+    });
+
+    it("refuses a `pi-bash-guard` dir WITHOUT a package.json (unknown identity stays fail-closed)", () => {
+      withTempDir((d) => {
+        // A dir that merely LOOKS guard-ish must not satisfy the guard: only the
+        // documented name or the manifest is proof of identity.
+        const guard = makeExtension(join(d, "extensions", "pi-bash-guard"));
+        const err = guardError("read-only", [guard]);
+        assert.ok(err, "expected a spawn error for an unidentified extension");
+        assert.match(err, /bash-guard is not in the resolved always-on extensions/);
+      });
+    });
+
+    it("refuses a different extension even when it resolves", () => {
+      withTempDir((d) => {
+        // Range check: some always-on extension present is not bash-guard.
+        const other = makeExtension(join(d, "extensions", "other-ext"), { name: "other-ext" });
+        const err = guardError("read-only", [other]);
+        assert.ok(err, "expected a spawn error when only another extension is present");
+        assert.match(err, /bash-guard is not in the resolved always-on extensions/);
+      });
+    });
+
+    it("keeps mode `off` and an absent mode unguarded with no guard present", () => {
+      // `off` means "unguarded by definition", so the range check must not start
+      // demanding a loaded guard for it (or every mode-less agent breaks).
+      assert.equal(guardError("off", []), null);
+      assert.equal(guardError(undefined, []), null);
+      // ...while a guard-requiring mode still fails closed on the same input.
+      const err = guardError("read-only", []);
+      assert.ok(err, "a guard-requiring mode with no guard must still refuse");
+      assert.match(err, /bash-guard is not in the resolved always-on extensions/);
+    });
+
+    it("allows a `bash-guard` symlink to a `pi-bash-guard` checkout (package identity)", () => {
+      withTempDir((d) => {
+        const checkout = makeExtension(
+          join(d, "repos", "pi-bash-guard"),
+          PI_BASH_GUARD_MANIFEST,
+        );
+        const extensionsDir = join(d, "extensions");
+        mkdirSync(extensionsDir, { recursive: true });
+        // The link name is resolved away, so the canonical basename is
+        // `pi-bash-guard`: only the manifest can identify the guard here.
+        const link = join(extensionsDir, "bash-guard");
+        symlinkSync(checkout, link, "dir");
+        assert.equal(guardError("prompt", [link]), null);
+      });
     });
   });
 

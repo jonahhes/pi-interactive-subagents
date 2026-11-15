@@ -153,6 +153,9 @@ All three are autonomous (`auto-exit: true`), carry their identity in the system
 
 Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Discovery priority: **project > global > package-bundled** — a project-local file overrides a bundled agent with the same name.
 
+Files may use LF or CRLF line endings, and may start with a UTF-8 BOM; both are normalized before parsing, so an agent directory copied between machines keeps working.
+A file whose `---` frontmatter block cannot be read is skipped with a one-time warning naming the file, instead of silently vanishing from `subagents_list` or silently falling through to a bundled agent with a different model.
+
 ```markdown
 ---
 name: my-agent
@@ -240,6 +243,7 @@ Without this, a restricted child would run `bash` with no guard at all.
 - The config list applies to all sub-agents; the agent frontmatter field `always-on-extensions` adds role-specific entries on top of it.
 - Frontmatter entries are ADDITIVE by default; a leading `-` makes one SUBTRACTIVE: it removes the matching global `alwaysOnExtensions` entry for that agent only (e.g. global config loads bash-guard for every sub-agent, and `always-on-extensions: -~/.pi/agent/extensions/bash-guard` on one agent opts that role out). Matching is by canonical path, so `~/...` and absolute forms (and symlinks) all match. An exclusion that matches nothing warns at spawn time.
 - Entries are extension directories (a `package.json` with a `pi.extensions` manifest, or an `index.ts`/`index.js`) or single extension files. Paths must be absolute or `~/`-prefixed (config.json is package-local, so relative paths are rejected).
+- The guard itself is recognized in the resolved set by the install dir name `bash-guard` or by its `package.json` name `pi-bash-guard`, so a checkout or package install under any other directory name (e.g. `~/.pi/agent/extensions/pi-bash-guard`) still satisfies a guard-requiring `bash-guard-mode`. Any other extension in the set does not. Name matching happens on the symlink-resolved path, so a `bash-guard` link into a differently named checkout is recognized through its manifest.
 - A missing entry does not break the spawn: it is dropped with a console warning at launch. The list is re-resolved at every spawn and resume, so `~/` entries track the home directory the launch runs under.
 - Per-agent entries (additions and exclusions) are snapshotted into the loadout sidecar and replayed on resume, exactly like the tool allowlist.
 - **Per-agent mode selection.** Loading bash-guard for every sub-agent is the floor; the `bash-guard-mode` frontmatter field (see [Frontmatter reference](#frontmatter-reference)) selects the mode for each agent, so read-only roles (scout) run `read-only` while the rest keep the default.

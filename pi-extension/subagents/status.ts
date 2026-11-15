@@ -2,6 +2,11 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+// pi's own agent-dir resolution: it expands a leading `~/` and ignores an empty
+// PI_CODING_AGENT_DIR. Re-implementing that here would silently disagree with
+// where pi actually keeps settings (an unexpanded `~/x` becomes a RELATIVE path
+// and an empty value becomes the cwd - both would read the wrong file quietly).
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { type SubagentWaitingReason } from "./activity.ts";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
@@ -10,11 +15,19 @@ export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
 
 // Resolve to the real (non-symlink) location so the upward `../..` lands in
-// the real package root (where config.json lives) regardless of how the
-// extension directory is linked/installed.
+// the real package root (where the bundled agents and config.json.example live)
+// regardless of how the extension directory is linked/installed.
 const PACKAGE_ROOT = join(realpathSync(dirname(fileURLToPath(import.meta.url))), "../..");
-const DEFAULT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
+const PACKAGE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
+export const CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
+
+/**
+ * File name of the user-level config in pi's agent config directory (next to
+ * `compact-thinking.json`, `pi-stamp.json`, ...). Kept out of the package so the
+ * live configuration survives a re-clone, `git clean -x`, or a fresh
+ * `pi install`, and so a linked checkout can be read-only.
+ */
+export const USER_CONFIG_FILENAME = "pi-interactive-subagents.json";
 
 export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
 export type SubagentStatusSource = "pi" | "claude";
@@ -262,7 +275,7 @@ function extensionLoadabilityError(value: string): string | null {
  * today's behaviour. The child process resolves the entries with its own
  * pi loader (pi supports both explicit files and extension directories), so
  * validation here is deliberately structural only: it rejects relative paths
- * (config.json is package-local, so they would be ambiguous) and unknown keys,
+ * (the config file can live outside the package, so they would be ambiguous) and unknown keys,
  * and warns (without failing the spawn) about entries that are missing or not
  * loadable on the parent's machine.
  */
@@ -297,7 +310,7 @@ export function parseAlwaysOnExtensionsConfig(
     if (value.startsWith("-")) {
       invalidConfig(
         source,
-        `alwaysOnExtensions.paths[${i}] is an exclusion marker (leading "-"): exclusions only apply per-agent via the always-on-extensions frontmatter, not in config.json`,
+        `alwaysOnExtensions.paths[${i}] is an exclusion marker (leading "-"): exclusions only apply per-agent via the always-on-extensions frontmatter, not in the global config`,
       );
     }
     if (value.startsWith("~/")) {
@@ -316,7 +329,7 @@ export function parseAlwaysOnExtensionsConfig(
     if (!value.startsWith("/")) {
       invalidConfig(
         source,
-        `alwaysOnExtensions.paths[${i}] "${entry}" must be an absolute or ~/ path (config.json is package-local, so relative paths are ambiguous)`,
+        `alwaysOnExtensions.paths[${i}] "${entry}" must be an absolute or ~/ path (the config file can live outside the package, so a relative entry would resolve against the extension)`,
       );
     }
     const problem = extensionLoadabilityError(value);
@@ -366,32 +379,114 @@ export function resolveSpawnBackend(
   );
 }
 
-function readSubagentConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
+/**
+ * A candidate is "present" only if it is a regular FILE: a directory that
+ * happens to be named `config.json` is not a config, and treating it as present
+ * made a LOWER-priority candidate abort the whole load (EISDIR) even though the
+ * winning file was fine. First hit wins, so only the winning file's read errors
+ * are fatal (an unreadable winner reports its real error).
+ */
+function isConfigFile(path: string): boolean {
   try {
-    return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code !== "ENOENT") throw error;
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function readSubagentConfigFile(
+  configPaths: string[],
+  examplePath: string,
+): { sourcePath: string; rawConfig: string } {
+  const existing = configPaths.filter(isConfigFile);
+
+  if (existing.length > 1) warnAmbiguousConfigOnce(existing);
+  for (const candidate of existing) {
+    try {
+      // Errors on the candidate actually in use are fatal on purpose: silently
+      // using a different file would hide the real configuration's problem.
+      return { sourcePath: candidate, rawConfig: readFileSync(candidate, "utf8") };
+    } catch (error) {
+      // The file vanished between the check and the read: it is simply absent.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
   }
 
   try {
     return { sourcePath: examplePath, rawConfig: readFileSync(examplePath, "utf8") };
   } catch (error) {
     const errno = error as NodeJS.ErrnoException;
-    if (errno.code === "ENOENT") {
+    // A directory named like the example is not a bundled default either.
+    if (errno.code === "ENOENT" || errno.code === "EISDIR") {
       throw new Error(
-        `Missing subagent config. Expected ${configPath} or ${examplePath}.`,
+        `Missing subagent config. Expected ${[...configPaths, examplePath].join(" or ")}.`,
       );
     }
     throw error;
   }
 }
 
+/**
+ * Two config files are NOT merged: the first candidate wins outright. That is
+ * predictable, but silent - and a stale package-local `config.json` quietly
+ * overriding the file the user just edited is exactly the kind of invisible
+ * shadowing that cost hours elsewhere in this extension. One warning per
+ * (path set) per session names both files and the winner.
+ */
+const warnedAmbiguousConfigSets = new Set<string>();
+function warnAmbiguousConfigOnce(configPaths: string[]): void {
+  // Keyed on the ORDERED list: the order decides the winner, so a different
+  // order is a different situation and must not be deduped into the same
+  // (possibly wrong) "using X, ignoring Y" message.
+  const key = configPaths.join("\n");
+  if (warnedAmbiguousConfigSets.has(key)) return;
+  warnedAmbiguousConfigSets.add(key);
+  const [active, ...ignored] = configPaths;
+  console.warn(
+    `[subagents] using ${active} and ignoring ${ignored.join(", ")} ` +
+      // No "user-level wins" claim: the winner is whatever comes first in the
+      // search order, and callers/tests may pass their own order.
+      `(subagent config files are not merged; the first existing file in the search order wins). ` +
+      `Delete the unused file to silence this warning.`,
+  );
+}
+
+export function resolveConfigCandidates(): string[] {
+  return [join(resolveAgentConfigDir(), USER_CONFIG_FILENAME), PACKAGE_CONFIG_PATH];
+}
+
+/**
+ * The ONE place the agent config directory is decided: pi's own resolver, so
+ * config lookup, agent discovery, and extension paths can never disagree.
+ * Deferring to pi is not cosmetic - it expands a leading `~/` and ignores an
+ * empty PI_CODING_AGENT_DIR, both of which would otherwise resolve to a
+ * cwd-relative path and silently read nothing.
+ */
+export function resolveAgentConfigDir(): string {
+  return getAgentDir();
+}
+
 export function loadSubagentConfig(
-  configPath = DEFAULT_CONFIG_PATH,
+  configPath?: string | string[],
   examplePath = CONFIG_EXAMPLE_PATH,
 ): SubagentConfig {
-  const { sourcePath, rawConfig } = readSubagentConfigFile(configPath, examplePath);
+  return loadSubagentConfigWithSource(configPath, examplePath).config;
+}
+
+/**
+ * Same lookup as `loadSubagentConfig`, plus the file that was actually read.
+ * Messages about config CONTENTS must name that file: with the config outside
+ * the package, a hardcoded "config.json" label points the user at a file this
+ * process never opened.
+ */
+export function loadSubagentConfigWithSource(
+  configPath?: string | string[],
+  examplePath = CONFIG_EXAMPLE_PATH,
+): { config: SubagentConfig; sourcePath: string } {
+  const configPaths =
+    typeof configPath === "string" ? [configPath] : (configPath ?? resolveConfigCandidates());
+  const { sourcePath, rawConfig } = readSubagentConfigFile(configPaths, examplePath);
 
   let parsed: unknown;
   try {
@@ -402,9 +497,12 @@ export function loadSubagentConfig(
   }
 
   return {
-    status: parseStatusConfig(parsed, sourcePath),
-    spawn: parseSpawnConfig(parsed, sourcePath),
-    alwaysOnExtensions: parseAlwaysOnExtensionsConfig(parsed, sourcePath),
+    config: {
+      status: parseStatusConfig(parsed, sourcePath),
+      spawn: parseSpawnConfig(parsed, sourcePath),
+      alwaysOnExtensions: parseAlwaysOnExtensionsConfig(parsed, sourcePath),
+    },
+    sourcePath,
   };
 }
 

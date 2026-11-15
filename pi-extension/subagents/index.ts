@@ -69,7 +69,10 @@ import {
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
-  loadSubagentConfig,
+  loadSubagentConfigWithSource,
+  CONFIG_EXAMPLE_PATH,
+  resolveAgentConfigDir,
+  resolveConfigCandidates,
   parseAlwaysOnExtensionsConfig,
   resolveSpawnSurface,
   resolveSpawnBackend,
@@ -231,9 +234,14 @@ const SPAWNING_TOOLS = [
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
-/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
+/**
+ * Resolve the global agent config directory. Delegates to pi's own resolver (in
+ * status.ts) so config lookup and agent/extension discovery cannot disagree:
+ * pi expands a leading `~/` and ignores an empty PI_CODING_AGENT_DIR, and both
+ * would otherwise become cwd-relative paths here.
+ */
 function getAgentConfigDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  return resolveAgentConfigDir();
 }
 
 /**
@@ -843,15 +851,31 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-const SUBAGENT_CONFIG = loadSubagentConfig();
+const { config: SUBAGENT_CONFIG, sourcePath: SUBAGENT_CONFIG_SOURCE } =
+  loadSubagentConfigWithSource();
+/**
+ * The file the bash-guard-mode hint should name. If the effective config is the
+ * bundled template (neither a user-level nor a package-local file exists), name
+ * the recommended user-level path instead: the template lives inside the
+ * installed package, where editing it is pointless (overwritten on upgrade) and
+ * often impossible (read-only install).
+ *
+ * Evaluated once at module load, like `SUBAGENT_CONFIG` itself: the session's
+ * config is read once, so a later PI_CODING_AGENT_DIR change does not move it
+ * (`/reload` does).
+ */
+const CONFIG_ADVICE_PATH =
+  SUBAGENT_CONFIG_SOURCE === CONFIG_EXAMPLE_PATH
+    ? resolveConfigCandidates()[0]
+    : SUBAGENT_CONFIG_SOURCE;
 const statusConfig = SUBAGENT_CONFIG.status;
-/** Configured spawn surface (config.json `spawn.surface`). */
+/** Configured spawn surface (spawn.surface). */
 const CONFIG_SPAWN_SURFACE: SpawnSurface = SUBAGENT_CONFIG.spawn.surface;
-/** Configured spawn backend preference (config.json `spawn.backend`, default "auto"). */
+/** Configured spawn backend preference (spawn.backend, default "auto"). */
 const CONFIG_SPAWN_BACKEND: SpawnBackend = SUBAGENT_CONFIG.spawn.backend ?? "auto";
 // Hand the config preference to the surface facade at init. surface.ts
 // cannot import index.ts (index.ts is the only facade importer — that would
-// be a cycle) and should not re-read config.json itself, so the preference
+// be a cycle) and should not re-read the config file itself, so the preference
 // crosses the boundary through this setter (documented in surface.ts).
 setConfigBackendPreference(CONFIG_SPAWN_BACKEND);
 
@@ -1511,7 +1535,7 @@ function canonicalExtensionPath(p: string): string {
 }
 
 /**
- * The always-on extensions for child pi processes: config.json
+ * The always-on extensions for child pi processes: the configured
  * `alwaysOnExtensions.paths` (validated once at module load) plus the
  * agent's `always-on-extensions` frontmatter entries, both re-validated per
  * spawn so `~/` entries track this process's home. Frontmatter entries may
@@ -1535,7 +1559,7 @@ export function resolveAlwaysOnExtensionPaths(extraEntries: string[] = []): stri
     }
   }
   const raw = { alwaysOnExtensions: { paths: [...configured, ...additions] } };
-  const { paths, errors } = parseAlwaysOnExtensionsConfig(raw, "config.json");
+  const { paths, errors } = parseAlwaysOnExtensionsConfig(raw, SUBAGENT_CONFIG_SOURCE);
   for (const error of errors) console.warn(`[subagents] ${error}`);
   const resolved = paths
     .map((entry) => resolveAlwaysOnExtensionEntry(entry))
@@ -1694,7 +1718,7 @@ export function assertBashGuardLoaded(
       `agent ${agentName} sets bash-guard-mode: ${mode} but bash-guard is not in the ` +
         `resolved always-on extensions (resolved: ${
           resolved.length > 0 ? resolved.join(", ") : "none"
-        }); install it and add it to alwaysOnExtensions (config.json) or ` +
+        }); install it and add it to alwaysOnExtensions (${CONFIG_ADVICE_PATH}) or ` +
         `always-on-extensions (agent frontmatter)`
     );
   }

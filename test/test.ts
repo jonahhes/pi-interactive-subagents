@@ -1,13 +1,14 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, symlinkSync, chmodSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { visibleWidth } from "@earendil-works/pi-tui";
 // Must be imported before the subagents module so the subagent-identity env
-// vars are cleared before index.ts captures PI_SUBAGENT_ALLOWED at load time.
+// vars are cleared (and PI_CODING_AGENT_DIR is shielded) before index.ts
+// captures PI_SUBAGENT_ALLOWED and loads the subagent config at load time.
 // eslint-disable-next-line import/first
 import "./_env-hermetic.ts";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
@@ -99,6 +100,11 @@ import {
   formatTransitionLine,
   observeStatus,
   loadSubagentConfig,
+  loadSubagentConfigWithSource,
+  resolveAgentConfigDir,
+  resolveConfigCandidates,
+  CONFIG_EXAMPLE_PATH,
+  USER_CONFIG_FILENAME,
   parseStatusConfig,
   parseSpawnConfig,
   parseAlwaysOnExtensionsConfig,
@@ -198,6 +204,24 @@ function restoreEnvVar(name: string, value: string | undefined) {
     return;
   }
   process.env[name] = value;
+}
+
+/**
+ * Capture console.warn while `run` executes (assertions happen afterwards).
+ * The config loader's ambiguity warning is once per path set per module
+ * lifetime, so a test must be able to inspect - and silence - it.
+ */
+function withCapturedWarnings(run: (warnings: string[]) => void) {
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (message: unknown) => {
+    warnings.push(String(message));
+  };
+  try {
+    run(warnings);
+  } finally {
+    console.warn = originalWarn;
+  }
 }
 
 function withMockedNow<T>(now: number, fn: () => T): T {
@@ -1040,6 +1064,486 @@ describe("status.ts", () => {
     });
   });
 
+  // --- Multi-candidate config lookup (user-level file first, then package) ---
+  //
+  // Tests that need BOTH candidates to exist pass the candidate list explicitly:
+  // the second default candidate is `<package root>/config.json`, whose presence
+  // depends on the machine (it is gitignored and may be absent on a clean
+  // clone), so a default-resolution test could otherwise pass or fail per
+  // machine. The behaviour of `resolveConfigCandidates()` itself is covered by
+  // "resolves the user-level candidate from PI_CODING_AGENT_DIR".
+
+  it("prefers the user-level config over the package-local one", () => {
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent");
+      const userConfigPath = join(agentDir, USER_CONFIG_FILENAME);
+      const packageConfigPath = join(dir, "package", "config.json");
+      const examplePath = join(dir, "config.json.example");
+      mkdirSync(agentDir, { recursive: true });
+      mkdirSync(join(dir, "package"), { recursive: true });
+      // Every value differs between the two files, so the assertion below can
+      // only pass if the user-level file is the one that was read: candidates
+      // are NOT merged, the first existing one wins outright.
+      writeFileSync(
+        userConfigPath,
+        JSON.stringify({ status: { enabled: false }, spawn: { surface: "tabs" } }),
+      );
+      writeFileSync(
+        packageConfigPath,
+        JSON.stringify({ status: { enabled: true }, spawn: { surface: "panes" } }),
+      );
+      writeFileSync(
+        examplePath,
+        JSON.stringify({ status: { enabled: true }, spawn: { surface: "panes" } }),
+      );
+
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        // Default resolution (no explicit candidate list): the user-level
+        // candidate comes from $PI_CODING_AGENT_DIR. The user values must win
+        // whether or not this machine happens to have a package-local file.
+        withCapturedWarnings((warnings) => {
+          const config = loadSubagentConfig(undefined, examplePath);
+          assert.deepEqual(config, {
+            status: { enabled: false, lineLimit: 4 },
+            spawn: { surface: "tabs" },
+            alwaysOnExtensions: { paths: [], errors: [] },
+          });
+
+          // The same ordering must hold for an explicit candidate list, which
+          // is the machine-independent form of the same two-file situation.
+          const explicit = loadSubagentConfig([userConfigPath, packageConfigPath], examplePath);
+          assert.deepEqual(explicit, config);
+
+          // Whether the package-local default candidate exists here is machine
+          // dependent, so only the ordering/form of any warning is asserted.
+          for (const warning of warnings) assert.match(warning, /subagent config files are not merged/);
+        });
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+      }
+    });
+  });
+
+  it("warns exactly once when a user-level and a package-local config both exist", () => {
+    withTempDir((dir) => {
+      const userConfigPath = join(dir, "agent", USER_CONFIG_FILENAME);
+      const packageConfigPath = join(dir, "package", "config.json");
+      const examplePath = join(dir, "config.json.example");
+      mkdirSync(join(dir, "agent"), { recursive: true });
+      mkdirSync(join(dir, "package"), { recursive: true });
+      writeFileSync(
+        userConfigPath,
+        JSON.stringify({ status: { enabled: false }, spawn: { surface: "tabs" } }),
+      );
+      writeFileSync(
+        packageConfigPath,
+        JSON.stringify({ status: { enabled: true }, spawn: { surface: "panes" } }),
+      );
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
+      const candidates = [userConfigPath, packageConfigPath];
+
+      withCapturedWarnings((warnings) => {
+        assert.equal(loadSubagentConfig(candidates, examplePath).status.enabled, false);
+        // The dedupe key is the ORDERED list of existing candidates, so a
+        // repeat load of the same list stays silent instead of warning per call
+        // (while a different order is a different winner, see the test below).
+        assert.equal(loadSubagentConfig(candidates, examplePath).status.enabled, false);
+
+        assert.equal(warnings.length, 1, `expected exactly one warning, got ${JSON.stringify(warnings)}`);
+        const [warning] = warnings;
+        // The warning must be actionable: which file won, which was ignored.
+        assert.ok(warning.includes(userConfigPath), warning);
+        assert.ok(warning.includes(packageConfigPath), warning);
+        assert.match(warning, /ignoring/);
+      });
+    });
+  });
+
+  it("uses the package-local config when no user-level config exists", () => {
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent");
+      const packageConfigPath = join(dir, "package", "config.json");
+      const examplePath = join(dir, "config.json.example");
+      mkdirSync(agentDir, { recursive: true });
+      mkdirSync(join(dir, "package"), { recursive: true });
+      writeFileSync(
+        packageConfigPath,
+        JSON.stringify({ status: { enabled: true }, spawn: { surface: "tabs" } }),
+      );
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: false } }));
+
+      // Back-compat: an agent dir without the user-level file must not shadow
+      // the legacy package-local config, and a one-candidate hit is not ambiguous.
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        withCapturedWarnings((warnings) => {
+          assert.deepEqual(
+            // Explicit candidates for hermeticity (see the note above); the first
+            // one lives in the empty agent dir the env var points at.
+            loadSubagentConfig([join(agentDir, USER_CONFIG_FILENAME), packageConfigPath], examplePath),
+            {
+              status: { enabled: true, lineLimit: 4 },
+              spawn: { surface: "tabs" },
+              alwaysOnExtensions: { paths: [], errors: [] },
+            },
+          );
+          assert.deepEqual(warnings, []);
+        });
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+      }
+    });
+  });
+
+  it("reports every searched path when no candidate and no example exists", () => {
+    withTempDir((dir) => {
+      const userConfigPath = join(dir, "agent", USER_CONFIG_FILENAME);
+      const packageConfigPath = join(dir, "package", "config.json");
+      const examplePath = join(dir, "config.json.example");
+
+      // Explicit candidates (see the note above): the message itself is the
+      // contract - every searched path must be listed, not just the first one.
+      assert.throws(
+        () => loadSubagentConfig([userConfigPath, packageConfigPath], examplePath),
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          assert.match(message, /Missing subagent config\. Expected /);
+          assert.ok(message.includes(userConfigPath), message);
+          assert.ok(message.includes(packageConfigPath), message);
+          assert.ok(message.includes(examplePath), message);
+          return true;
+        },
+      );
+    });
+  });
+
+  it("fails on invalid JSON in the user-level config instead of falling back", () => {
+    withTempDir((dir) => {
+      const userConfigPath = join(dir, "agent", USER_CONFIG_FILENAME);
+      const packageConfigPath = join(dir, "package", "config.json");
+      const examplePath = join(dir, "config.json.example");
+      mkdirSync(join(dir, "agent"), { recursive: true });
+      mkdirSync(join(dir, "package"), { recursive: true });
+      writeFileSync(userConfigPath, "{\n");
+      writeFileSync(packageConfigPath, JSON.stringify({ status: { enabled: true } }));
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
+
+      withCapturedWarnings(() => {
+        // Fail fast: a broken user-level file is a bug in the file the user
+        // just edited. Silently loading the package-local file instead would
+        // hide it (the same rule the single-candidate loader already follows).
+        assert.throws(
+          () => loadSubagentConfig([userConfigPath, packageConfigPath], examplePath),
+          (error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error);
+            // The broken source is named precisely; the valid package-local file
+            // was never parsed and so is never blamed.
+            assert.ok(
+              message.startsWith(`Invalid JSON in subagent config ${userConfigPath}:`),
+              message,
+            );
+            return true;
+          },
+        );
+      });
+    });
+  });
+
+  it("resolves the user-level candidate from PI_CODING_AGENT_DIR", () => {
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousHome = process.env.HOME;
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(join(agentDir, USER_CONFIG_FILENAME), JSON.stringify({ status: { enabled: true } }));
+
+      // Pin the DOCUMENTED file name as a literal: deriving every expectation from
+      // USER_CONFIG_FILENAME would keep this suite green through a rename that the
+      // README still documents (i.e. a file pi never reads).
+      assert.equal(USER_CONFIG_FILENAME, "pi-interactive-subagents.json");
+
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        const candidates = resolveConfigCandidates();
+        assert.equal(candidates.length, 2);
+        assert.equal(candidates[0], join(agentDir, "pi-interactive-subagents.json"));
+        // The second candidate is the legacy package-local file, never the example.
+        assert.match(candidates[1], /[/\\]config\.json$/);
+        assert.ok(!candidates[1].endsWith(".example"));
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+      }
+
+      // Without the env override the path comes from the home directory, not a
+      // cached value: pin $HOME so the host's real ~/.pi/agent never leaks in.
+      const fakeHome = join(dir, "home");
+      mkdirSync(fakeHome, { recursive: true });
+      delete process.env.PI_CODING_AGENT_DIR;
+      process.env.HOME = fakeHome;
+      try {
+        assert.equal(homedir(), fakeHome);
+        assert.equal(
+          resolveConfigCandidates()[0],
+          join(fakeHome, ".pi", "agent", USER_CONFIG_FILENAME),
+        );
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+        restoreEnvVar("HOME", previousHome);
+      }
+    });
+  });
+
+  it("treats an explicit config path as exclusive of the user-level file", () => {
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent");
+      const configPath = join(dir, "config.json");
+      const examplePath = join(dir, "config.json.example");
+      mkdirSync(agentDir, { recursive: true });
+      // A user-level config exists and says "disabled": the explicit single
+      // string must not consult it (old call sites/tests keep their meaning).
+      writeFileSync(join(agentDir, USER_CONFIG_FILENAME), JSON.stringify({ status: { enabled: false } }));
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
+
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        withCapturedWarnings((warnings) => {
+          const config = loadSubagentConfig(configPath, examplePath);
+          assert.equal(config.status.enabled, true);
+          assert.deepEqual(warnings, []);
+        });
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+      }
+    });
+  });
+
+  it("ignores a lower-priority candidate that is a directory", () => {
+    withTempDir((dir) => {
+      const userConfigPath = join(dir, "agent", USER_CONFIG_FILENAME);
+      // A directory that merely happens to be named config.json is not a
+      // config. Treating it as present made an unreadable LOWER-priority
+      // candidate abort the whole load (EISDIR) although the winning file was
+      // perfectly fine - first hit wins, so it must simply not be a candidate.
+      const dirCandidatePath = join(dir, "package", "config.json");
+      const examplePath = join(dir, "config.json.example");
+      mkdirSync(join(dir, "agent"), { recursive: true });
+      mkdirSync(dirCandidatePath, { recursive: true });
+      writeFileSync(userConfigPath, JSON.stringify({ status: { enabled: false } }));
+
+      withCapturedWarnings((warnings) => {
+        // No throw, and the one real file wins; a single real file is also not
+        // ambiguous, so the directory must not produce an ambiguity warning.
+        assert.equal(
+          loadSubagentConfig([userConfigPath, dirCandidatePath], examplePath).status.enabled,
+          false,
+        );
+        assert.deepEqual(warnings, []);
+      });
+
+      // As the ONLY candidate it is absent: with no example to fall back to the
+      // error names the searched paths (never EISDIR), and with an example the
+      // bundled defaults are used.
+      assert.throws(
+        () => loadSubagentConfig([dirCandidatePath], examplePath),
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          assert.match(message, /Missing subagent config\. Expected /);
+          assert.ok(message.includes(dirCandidatePath), message);
+          assert.ok(message.includes(examplePath), message);
+          return true;
+        },
+      );
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
+      assert.equal(loadSubagentConfig([dirCandidatePath], examplePath).status.enabled, true);
+    });
+  });
+
+  it("warns per ordering of the ambiguous config set", () => {
+    withTempDir((dir) => {
+      const userConfigPath = join(dir, "agent", USER_CONFIG_FILENAME);
+      const packageConfigPath = join(dir, "package", "config.json");
+      const examplePath = join(dir, "config.json.example");
+      mkdirSync(join(dir, "agent"), { recursive: true });
+      mkdirSync(join(dir, "package"), { recursive: true });
+      writeFileSync(userConfigPath, JSON.stringify({ status: { enabled: false } }));
+      writeFileSync(packageConfigPath, JSON.stringify({ status: { enabled: true } }));
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
+
+      withCapturedWarnings((warnings) => {
+        // Same order twice: the dedupe key is the candidate list as given, so
+        // the second load stays silent.
+        assert.equal(loadSubagentConfig([userConfigPath, packageConfigPath], examplePath).status.enabled, false);
+        assert.equal(loadSubagentConfig([userConfigPath, packageConfigPath], examplePath).status.enabled, false);
+        assert.equal(warnings.length, 1, `expected exactly one warning, got ${JSON.stringify(warnings)}`);
+        assert.ok(
+          warnings[0].includes(`using ${userConfigPath} and ignoring ${packageConfigPath}`),
+          warnings[0],
+        );
+
+        // Reversed order is a different situation (the winner changes), so it
+        // must warn again and name the NEW winner - never a stale "using" file.
+        assert.equal(loadSubagentConfig([packageConfigPath, userConfigPath], examplePath).status.enabled, true);
+        assert.equal(warnings.length, 2, `expected a second warning, got ${JSON.stringify(warnings)}`);
+        assert.ok(
+          warnings[1].includes(`using ${packageConfigPath} and ignoring ${userConfigPath}`),
+          warnings[1],
+        );
+      });
+    });
+  });
+
+  it("expands a ~/ PI_CODING_AGENT_DIR and treats an empty one as unset", () => {
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousHome = process.env.HOME;
+    withTempDir((dir) => {
+      const fakeHome = join(dir, "home");
+      mkdirSync(fakeHome, { recursive: true });
+      process.env.HOME = fakeHome;
+      try {
+        assert.equal(homedir(), fakeHome);
+
+        // pi's getAgentDir() expands a leading `~/` against $HOME. Without that,
+        // the value stays relative (`cwd/~/agent`) and the user-level config is
+        // silently never found.
+        process.env.PI_CODING_AGENT_DIR = "~/agent";
+        const expanded = resolveConfigCandidates()[0];
+        assert.equal(expanded, join(fakeHome, "agent", USER_CONFIG_FILENAME));
+        assert.ok(isAbsolute(expanded), expanded);
+
+        // An empty value is not "the cwd" either: pi ignores it and uses the
+        // default agent dir.
+        process.env.PI_CODING_AGENT_DIR = "";
+        const empty = resolveConfigCandidates()[0];
+        assert.equal(empty, join(fakeHome, ".pi", "agent", USER_CONFIG_FILENAME));
+        assert.ok(isAbsolute(empty), empty);
+
+        // An absolute value is used verbatim.
+        const explicitDir = join(dir, "explicit-agent");
+        process.env.PI_CODING_AGENT_DIR = explicitDir;
+        assert.equal(
+          resolveConfigCandidates()[0],
+          join(explicitDir, USER_CONFIG_FILENAME),
+        );
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+        restoreEnvVar("HOME", previousHome);
+      }
+    });
+  });
+
+  it("resolves the agent config dir to the same directory config lookup uses", () => {
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousHome = process.env.HOME;
+    withTempDir((dir) => {
+      const fakeHome = join(dir, "home");
+      mkdirSync(fakeHome, { recursive: true });
+      process.env.HOME = fakeHome;
+      try {
+        assert.equal(homedir(), fakeHome);
+
+        // Agent/extension discovery and config lookup share ONE resolver. If they
+        // drift, the file the docs tell the user to edit is not the file the
+        // process reads (and agents silently come from a different dir).
+        process.env.PI_CODING_AGENT_DIR = "~/agent";
+        assert.equal(resolveAgentConfigDir(), join(fakeHome, "agent"));
+        assert.equal(resolveAgentConfigDir(), dirname(resolveConfigCandidates()[0]));
+
+        process.env.PI_CODING_AGENT_DIR = "";
+        assert.equal(resolveAgentConfigDir(), join(fakeHome, ".pi", "agent"));
+        assert.equal(resolveAgentConfigDir(), dirname(resolveConfigCandidates()[0]));
+
+        // Cross-module (index.ts discovery): with a `~/`-prefixed agent dir, a
+        // global agent file must be found there - previously the value stayed
+        // relative and discovery fell through to the bundled copy.
+        mkdirSync(join(fakeHome, "agent", "agents"), { recursive: true });
+        writeFileSync(
+          join(fakeHome, "agent", "agents", "worker.md"),
+          "---\nname: worker\ndescription: hermetic global worker\nauto-exit: true\n---\n\nBody.\n",
+        );
+        process.env.PI_CODING_AGENT_DIR = "~/agent";
+        assert.equal(
+          (subagentsModule as any).__test__.loadAgentDefaults("worker")?.description,
+          "hermetic global worker",
+        );
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+        restoreEnvVar("HOME", previousHome);
+      }
+    });
+  });
+
+  it("reports the config file it actually read", () => {
+    withTempDir((dir) => {
+      const userConfigPath = join(dir, "agent", USER_CONFIG_FILENAME);
+      const packageConfigPath = join(dir, "package", "config.json");
+      const examplePath = join(dir, "config.json.example");
+      const absentPath = join(dir, "absent.json");
+      mkdirSync(join(dir, "agent"), { recursive: true });
+      mkdirSync(join(dir, "package"), { recursive: true });
+      writeFileSync(userConfigPath, JSON.stringify({ status: { enabled: false } }));
+      writeFileSync(packageConfigPath, JSON.stringify({ status: { enabled: true } }));
+      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }));
+
+      withCapturedWarnings(() => {
+        // Runtime messages (e.g. "add it to alwaysOnExtensions (<path>)") must
+        // name the file that was read, not a hardcoded package-local name.
+        const winning = loadSubagentConfigWithSource(
+          [userConfigPath, packageConfigPath],
+          examplePath,
+        );
+        assert.equal(winning.sourcePath, userConfigPath);
+        // The thin wrapper must not drift from the source-aware loader.
+        assert.deepEqual(
+          winning.config,
+          loadSubagentConfig([userConfigPath, packageConfigPath], examplePath),
+        );
+
+        // Fallback: the bundled example is the reported source.
+        const fromExample = loadSubagentConfigWithSource(absentPath, examplePath);
+        assert.equal(fromExample.sourcePath, examplePath);
+        assert.deepEqual(fromExample.config, loadSubagentConfig(absentPath, examplePath));
+        assert.deepEqual(fromExample.config.status, { enabled: true, lineLimit: 4 });
+      });
+    });
+  });
+
+  it("follows a symlinked user-level config", () => {
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent");
+      const realConfigPath = join(dir, "dotfiles", USER_CONFIG_FILENAME);
+      const userConfigPath = join(agentDir, USER_CONFIG_FILENAME);
+      mkdirSync(agentDir, { recursive: true });
+      mkdirSync(join(dir, "dotfiles"), { recursive: true });
+      // The migration onto this machine moves a symlinked file into
+      // ~/.pi/agent: statSync follows links, so a symlinked config must count as
+      // present (and be read), not be mistaken for a directory or skipped.
+      writeFileSync(
+        realConfigPath,
+        JSON.stringify({ status: { enabled: false }, spawn: { surface: "tabs" } }),
+      );
+      symlinkSync(realConfigPath, userConfigPath);
+
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        withCapturedWarnings(() => {
+          const loaded = loadSubagentConfigWithSource(undefined, join(dir, "config.json.example"));
+          // The reported source is the searched candidate (the user-level path),
+          // even though the bytes live behind the link.
+          assert.equal(loaded.sourcePath, userConfigPath);
+          assert.deepEqual(loaded.config.status, { enabled: false, lineLimit: 4 });
+          assert.equal(loaded.config.spawn.surface, "tabs");
+        });
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+      }
+    });
+  });
+
   it("keeps a missing snapshot as starting until the fixed watchdog threshold", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, { snapshot: "missing" }, 1_000);
@@ -1526,15 +2030,42 @@ describe("subagent discovery", () => {
   });
 
   it("bundled scout/researcher/worker/reviewer/adversarial-review all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker", "reviewer", "adversarial-review"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous, auto-exit)`,
-      );
-    }
+    // This repo's `agents/` ships only scout, researcher, and worker: reviewer and
+    // adversarial-review come from the user's GLOBAL agents dir, so this test used
+    // to depend on the host - a clean clone/CI failed (no such files) and a
+    // developer whose personal worker.md sets `interactive: true` failed too
+    // (global shadows bundled). Instead, give the two non-bundled names valid
+    // definitions in a temp agent dir (same frontmatter shape the real ones use:
+    // `auto-exit: true`, no `interactive`) and let the other three resolve from
+    // the bundled `agents/` dir. Fixture files are written, not copied from the
+    // host, so the definition shape under test is the same on every machine.
+    const shieldedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent");
+      const agentsDir = join(agentDir, "agents");
+      mkdirSync(agentsDir, { recursive: true });
+      for (const name of ["reviewer", "adversarial-review"]) {
+        writeFileSync(
+          join(agentsDir, `${name}.md`),
+          `---\nname: ${name}\ndescription: test fixture for the non-bundled ${name} agent\nauto-exit: true\n---\n\nTrivial body.\n`,
+        );
+      }
+
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        for (const name of ["scout", "researcher", "worker", "reviewer", "adversarial-review"]) {
+          const defs = testApi.loadAgentDefaults(name);
+          assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+          assert.equal(
+            testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
+            false,
+            `${name} should resolve as non-interactive (autonomous, auto-exit)`,
+          );
+        }
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", shieldedAgentDir);
+      }
+    });
   });
 
   it("worker is granted the spawning toolset restricted to its declared agents", () => {
@@ -5426,6 +5957,23 @@ describe("bash-guard-mode (per-agent guard modes)", () => {
 
     afterEach(() => {
       testApi.__setAlwaysOnExtensionsConfigForTest(null);
+    });
+
+    it("names an editable config file in the missing-guard hint", () => {
+      // The hint must point at a file the user can actually edit: the config file
+      // in effect, or - when the effective config is the bundled example - the
+      // recommended user-level path. Editing the template inside the installed
+      // package is pointless (overwritten on upgrade) and often impossible
+      // (read-only install).
+      // The effective file is recomputed here the same way the module did at
+      // import time; the shield in _env-hermetic.ts keeps that resolution stable.
+      const { sourcePath } = loadSubagentConfigWithSource();
+      const expectedAdvice =
+        sourcePath === CONFIG_EXAMPLE_PATH ? resolveConfigCandidates()[0] : sourcePath;
+
+      const message = guardError("read-only", []);
+      assert.ok(message, "expected a spawn error while bash-guard is absent");
+      assert.ok(message!.includes(`alwaysOnExtensions (${expectedAdvice})`), message!);
     });
 
     it("allows the documented `bash-guard` linked-checkout dir", () => {

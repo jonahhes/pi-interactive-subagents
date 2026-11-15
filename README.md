@@ -37,7 +37,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 ### Layout: panes vs tabs
 
-By default every spawn splits a **pane** off the caller's pane, so a burst of subagents crowds one window. Opt in to **tabs** in `config.json` (copy `config.json.example`) and each first-level subagent opens in its own, labelled tab instead:
+By default every spawn splits a **pane** off the caller's pane, so a burst of subagents crowds one window. Opt in to **tabs** in your config (see [Status widget & configuration](#status-widget--configuration)) and each first-level subagent opens in its own, labelled tab instead:
 
 ```json
 {
@@ -51,7 +51,7 @@ By default every spawn splits a **pane** off the caller's pane, so a burst of su
 
 Tabs and panes are always created **without stealing focus** (`tmux new-window -d` / `herdr tab create --no-focus`). A tab is closed with the subagent: killing its last pane auto-closes the whole tab/window in both tmux and herdr. An empty tab can also just be closed by hand.
 
-`PI_SUBAGENT_SPAWN_SURFACE` (`panes` or `tabs`, case-insensitive) overrides the config value for a single run, without editing `config.json`:
+`PI_SUBAGENT_SPAWN_SURFACE` (`panes` or `tabs`, case-insensitive) overrides the config value for a single run, without editing the config file:
 
 ```bash
 export PI_SUBAGENT_SPAWN_SURFACE=tabs
@@ -63,7 +63,7 @@ When no terminal multiplexer is available — or when it is explicitly selected 
 
 **`auto` never errors.** Backend resolution is `PI_SUBAGENT_BACKEND` env override → `spawn.backend` config → environment detection (herdr → tmux) → **background floor**. A bare environment that used to refuse with "a terminal multiplexer is required" now spawns headless instead. An explicit `herdr` or `tmux` that is unavailable is still an error, naming the setup.
 
-- **`spawn.backend`** in `config.json` — `"auto"` (default), `"herdr"`, `"tmux"`, or `"background"`. When the resolved backend is herdr or tmux, `spawn.surface` (`panes`/`tabs`) decides the shape as above; it is **ignored** for `background`.
+- **`spawn.backend`** in the config file — `"auto"` (default), `"herdr"`, `"tmux"`, or `"background"`. When the resolved backend is herdr or tmux, `spawn.surface` (`panes`/`tabs`) decides the shape as above; it is **ignored** for `background`.
 - **`PI_SUBAGENT_BACKEND`** env override — same values, checked before the config. It is also **propagated to children**: each spawn pins the child to the backend the parent resolved (never `auto`), and the child consults the override before environment detection. This is what keeps nested spawns from re-detecting a different multiplexer inherited from the parent (e.g. a background child spawned by a herdr session spawning its own children as herdr panes off the grandparent's pane).
 
 v1 limitations (a background child has no TUI):
@@ -182,7 +182,7 @@ You are a specialized agent that does X...
 | `model-fallback` | string | Optional one-shot fallback model: `inherit` (copies the immediate spawner's live model) or a concrete `provider/model[:thinking]`. Absent = no fallback (custom agents stay opt-in). Invalid values are a spawn error naming the raw value and the source file |
 | `thinking` | string | `minimal`, `low`, `medium`, `high`, or `xhigh` (levels the model's `thinkingLevelMap` does not support are clamped) |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `video_extract`, `youtube_search`, `google_image_search`. Grantable pi builtin extensions (loaded into the child via `-e builtin:<name>`, distinct from the built-in tool list above): `codemode` and `tool_search`. Only the extensions backing the listed tools are loaded into the child |
-| `bash-guard-mode` | string | Bash-guard mode for this agent's child: `off`, `prompt`, `floor`, or `read-only` (case-insensitive). Validated at spawn — a bad value is a spawn error naming the raw value and the source file (`agent <name> has invalid bash-guard-mode '<raw>' (expected off, prompt, floor, or read-only) in <file>`). The value is snapshotted into the loadout, so a resume replays the mode even if the agent file changed in the meantime. An explicit value wins over bash-guard's own `PI_SUBAGENT_SESSION` heuristic; an absent field leaves the heuristic in force (subagent → full floor). Fail-closed: a mode that requires the guard (`read-only`, `floor`, `prompt`) refuses to spawn when bash-guard is not among the resolved always-on extensions (`agent <name> sets bash-guard-mode: <mode> but bash-guard is not in the resolved always-on extensions (resolved: <paths or none>); install it and add it to alwaysOnExtensions (config.json) or always-on-extensions (agent frontmatter)`), and a `cli: claude` agent cannot use any mode (`bash-guard-mode requires the pi CLI (the guard is a pi extension); agent <name> cannot use it with cli: claude`). `off` never requires the guard |
+| `bash-guard-mode` | string | Bash-guard mode for this agent's child: `off`, `prompt`, `floor`, or `read-only` (case-insensitive). Validated at spawn — a bad value is a spawn error naming the raw value and the source file (`agent <name> has invalid bash-guard-mode '<raw>' (expected off, prompt, floor, or read-only) in <file>`). The value is snapshotted into the loadout, so a resume replays the mode even if the agent file changed in the meantime. An explicit value wins over bash-guard's own `PI_SUBAGENT_SESSION` heuristic; an absent field leaves the heuristic in force (subagent → full floor). Fail-closed: a mode that requires the guard (`read-only`, `floor`, `prompt`) refuses to spawn when bash-guard is not among the resolved always-on extensions (`agent <name> sets bash-guard-mode: <mode> but bash-guard is not in the resolved always-on extensions (resolved: <paths or none>); install it and add it to alwaysOnExtensions (<the config file in effect, or ~/.pi/agent/pi-interactive-subagents.json when only the bundled template exists>) or always-on-extensions (agent frontmatter)`), and a `cli: claude` agent cannot use any mode (`bash-guard-mode requires the pi CLI (the guard is a pi extension); agent <name> cannot use it with cli: claude`). `off` never requires the guard |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `always-on-extensions` | string | Comma-separated extension paths loaded into this agent's child in addition to the global `alwaysOnExtensions` config (see [Always-on extensions](#always-on-extensions)). Absolute or `~/` paths; a leading `-` excludes a matching global entry |
 | `skills` | string | Comma-separated skill names to auto-load |
@@ -242,7 +242,7 @@ Without this, a restricted child would run `bash` with no guard at all.
 
 - The config list applies to all sub-agents; the agent frontmatter field `always-on-extensions` adds role-specific entries on top of it.
 - Frontmatter entries are ADDITIVE by default; a leading `-` makes one SUBTRACTIVE: it removes the matching global `alwaysOnExtensions` entry for that agent only (e.g. global config loads bash-guard for every sub-agent, and `always-on-extensions: -~/.pi/agent/extensions/bash-guard` on one agent opts that role out). Matching is by canonical path, so `~/...` and absolute forms (and symlinks) all match. An exclusion that matches nothing warns at spawn time.
-- Entries are extension directories (a `package.json` with a `pi.extensions` manifest, or an `index.ts`/`index.js`) or single extension files. Paths must be absolute or `~/`-prefixed (config.json is package-local, so relative paths are rejected).
+- Entries are extension directories (a `package.json` with a `pi.extensions` manifest, or an `index.ts`/`index.js`) or single extension files. Paths must be absolute or `~/`-prefixed (the config file can live outside the package, so a relative entry would resolve against the extension, not against anything the user chose).
 - The guard itself is recognized in the resolved set by the install dir name `bash-guard` or by its `package.json` name `pi-bash-guard`, so a checkout or package install under any other directory name (e.g. `~/.pi/agent/extensions/pi-bash-guard`) still satisfies a guard-requiring `bash-guard-mode`. Any other extension in the set does not. Name matching happens on the symlink-resolved path, so a `bash-guard` link into a differently named checkout is recognized through its manifest.
 - A missing entry does not break the spawn: it is dropped with a console warning at launch. The list is re-resolved at every spawn and resume, so `~/` entries track the home directory the launch runs under.
 - Per-agent entries (additions and exclusions) are snapshotted into the loadout sidecar and replayed on resume, exactly like the tool allowlist.
@@ -272,7 +272,15 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). A `waiting` row can carry a reason annotation from the activity file's `waitingReason`: `waiting 2m · question` — an `ask_question` is pending the orchestrator's reply — or `waiting 2m · own children` — the sub-agent is parked on its own child sub-agents' results. A higher-priority state label (`interrupted`, `done`) takes the annotation slot instead. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages (and status/question messages) expand when you click them, or with `Ctrl+O` to toggle everything. The `subagent` / `subagent_message` tool blocks expand the same way — a click or `Ctrl+O` reveals the full task / message, collapsing back to the one-line preview.
 
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
+Status display is configured in a JSON file, looked up in this order (the first file that exists wins; files are **not** merged):
+
+1. `$PI_CODING_AGENT_DIR/pi-interactive-subagents.json`, defaulting to `~/.pi/agent/pi-interactive-subagents.json` (recommended). The variable follows pi's own rules for the agent directory: a leading `~/` is expanded and an empty value is ignored, so this is always the directory pi itself uses.
+2. `<package root>/config.json` (legacy package-local file; gitignored)
+3. `<package root>/config.json.example` (bundled defaults)
+
+Keep the live file under `~/.pi/agent/` so it survives a re-clone, `git clean -x`, or a fresh `pi install`, and so a linked checkout can stay read-only.
+If both a user-level and a package-local file exist, the user-level one wins and a one-time warning names both paths (a stale `config.json` inside the repo silently overriding the file you just edited is exactly the kind of shadowing this extension should never do quietly).
+The file is read once when the session starts, so `/reload` after editing it.
 
 ```json
 {
